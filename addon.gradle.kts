@@ -10,14 +10,30 @@ fun Project.readInitProperty(name: String): String? =
     (findProperty("init.$name") as String?)?.trim()?.takeIf { it.isNotEmpty() }
 
 fun prompt(label: String, default: String = ""): String {
-    val console = System.console()
-        ?: error(
-            "No interactive console available. Pass -Pinit.modName=... -Pinit.modId=... " +
-                "-Pinit.modGroup=... and other init.* properties instead.",
-        )
     val suffix = if (default.isNotEmpty()) " [$default]" else ""
-    val answer = console.readLine("$label$suffix: ")?.trim().orEmpty()
-    return answer.ifEmpty { default }
+    val promptText = "$label$suffix: "
+
+    System.console()?.let { console ->
+        return console.readLine(promptText)?.trim().orEmpty().ifEmpty { default }
+    }
+
+    // Gradle daemon does not attach a console; stdin fallback works with --no-daemon in a real terminal.
+    return try {
+        System.out.print(promptText)
+        System.out.flush()
+        java.io.BufferedReader(java.io.InputStreamReader(System.`in`, Charsets.UTF_8))
+            .readLine()
+            ?.trim()
+            .orEmpty()
+            .ifEmpty { default }
+    } catch (exception: Exception) {
+        throw GradleException(
+            "Interactive input is unavailable. Use scripts/init-project.ps1 or scripts/init-project.sh, " +
+                "run .\\gradlew.bat initProject --no-daemon --no-configuration-cache from a terminal, " +
+                "or pass -Pinit.modName=... -Pinit.modId=... -Pinit.modGroup=... and other init.* properties.",
+            exception,
+        )
+    }
 }
 
 fun toModId(modName: String): String =
@@ -102,6 +118,41 @@ fun updateMcModInfo(
     file.writeText(content)
 }
 
+fun applyServerOnlyAnnotation(mainClassFile: java.io.File, serverOnly: Boolean) {
+    var content = mainClassFile.readText()
+    val remoteVersionsClause = """, acceptableRemoteVersions = "*""""
+    val remoteVersionsPattern = Regex(""",\s*acceptableRemoteVersions\s*=\s*"\*"""")
+
+    content = if (serverOnly) {
+        if (remoteVersionsPattern.containsMatchIn(content)) {
+            content
+        } else {
+            content.replace(
+                Regex("""(acceptedMinecraftVersions\s*=\s*"\[[^\]]+\]")(\s*\))"""),
+                "$1$remoteVersionsClause$2",
+            )
+        }
+    } else {
+        content.replace(remoteVersionsPattern, "")
+    }
+
+    mainClassFile.writeText(content)
+}
+
+fun findMainModClassFile(sourceRoot: java.io.File): java.io.File? =
+    sourceRoot.walkTopDown()
+        .filter { it.isFile && it.extension == "java" }
+        .firstOrNull { it.readText().contains("@Mod(") }
+
+fun parseBooleanProperty(value: String?): Boolean? =
+    value?.trim()?.lowercase()?.let {
+        when (it) {
+            "true", "yes", "y", "1" -> true
+            "false", "no", "n", "0" -> false
+            else -> null
+        }
+    }
+
 tasks.register("initProject") {
     group = "GTNH Buildscript"
     description = "Configure template placeholders for a new mod (name, id, package, sources)"
@@ -133,6 +184,8 @@ tasks.register("initProject") {
         val url = project.readInitProperty("url") ?: prompt("Project URL (optional)", "")
         val writeLicense = project.readInitProperty("license")?.toBooleanStrictOrNull()
             ?: prompt("Create LICENSE from LICENSE-template? (y/N)", "n").let { it.equals("y", true) || it.equals("yes", true) }
+        val serverOnlyMod = project.readInitProperty("serverOnly")?.let { parseBooleanProperty(it) }
+            ?: prompt("Server-only mod (clients without the mod can connect)? (y/N)", "n").let { it.equals("y", true) || it.equals("yes", true) }
         val copyright = when {
             !writeLicense -> project.readInitProperty("copyright") ?: author
             else -> project.readInitProperty("copyright") ?: prompt("Copyright holder for LICENSE", author)
@@ -153,6 +206,9 @@ tasks.register("initProject") {
         updateGradleProperty(gradleProperties, "modId", modId)
         updateGradleProperty(gradleProperties, "modGroup", modGroup)
         updateGradleProperty(gradleProperties, "generateGradleTokenClass", "$modGroup.Tags")
+        updateGradleProperty(gradleProperties, "serverOnlyMod", serverOnlyMod.toString())
+
+        var mainModClassFile: java.io.File? = null
 
         if (oldSourceRoot.exists()) {
             val newSourceRoot = layout.projectDirectory.dir("src/main/java/${modGroup.replace('.', '/')}").asFile
@@ -175,7 +231,16 @@ tasks.register("initProject") {
                     oldMainFile.delete()
                 }
             }
+
+            mainModClassFile = newMainFile.takeIf { it.exists() } ?: oldMainFile.takeIf { it.exists() }
+        } else {
+            val sourceRoot = layout.projectDirectory.dir("src/main/java/${modGroup.replace('.', '/')}").asFile
+            mainModClassFile = java.io.File(sourceRoot, "$mainClass.java").takeIf { it.exists() }
+                ?: findMainModClassFile(sourceRoot)
         }
+
+        mainModClassFile?.let { applyServerOnlyAnnotation(it, serverOnlyMod) }
+            ?: logger.warn("Main @Mod class not found; skipped serverOnlyMod annotation update.")
 
         val mcModInfo = layout.projectDirectory.file("src/main/resources/mcmod.info").asFile
         updateMcModInfo(
@@ -200,9 +265,33 @@ tasks.register("initProject") {
         logger.lifecycle("  modId       = $modId")
         logger.lifecycle("  modGroup    = $modGroup")
         logger.lifecycle("  main class  = $mainClass")
+        logger.lifecycle("  serverOnly  = $serverOnlyMod")
         logger.lifecycle("")
         logger.lifecycle("Next steps:")
         logger.lifecycle("  .\\gradlew.bat setupDecompWorkspace")
         logger.lifecycle("  .\\gradlew.bat build")
+    }
+}
+
+tasks.register("syncServerOnlyMod") {
+    group = "GTNH Buildscript"
+    description = "Applies or removes acceptableRemoteVersions on the @Mod class from serverOnlyMod in gradle.properties"
+    notCompatibleWithConfigurationCache("Rewrites main mod source file")
+
+    doLast {
+        val modGroup = (project.findProperty("modGroup") as String?)?.trim().orEmpty()
+        require(modGroup.isNotEmpty()) { "modGroup is not set in gradle.properties." }
+
+        val serverOnlyMod = parseBooleanProperty(project.findProperty("serverOnlyMod") as String?)
+            ?: throw GradleException("serverOnlyMod must be true or false in gradle.properties.")
+
+        val sourceRoot = layout.projectDirectory.dir("src/main/java/${modGroup.replace('.', '/')}").asFile
+        val mainModClassFile = findMainModClassFile(sourceRoot)
+            ?: throw GradleException("Could not find a @Mod class under src/main/java/${modGroup.replace('.', '/')}.")
+
+        applyServerOnlyAnnotation(mainModClassFile, serverOnlyMod)
+        logger.lifecycle(
+            "Updated ${mainModClassFile.name}: acceptableRemoteVersions = \"*\" is ${if (serverOnlyMod) "enabled" else "removed"}.",
+        )
     }
 }
